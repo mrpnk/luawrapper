@@ -46,14 +46,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
-#include <boost/any.hpp>
-#include <boost/format.hpp>
-#include <boost/mpl/distance.hpp>
-#include <boost/mpl/transform.hpp>
-#include <boost/optional.hpp>
-#include <boost/variant.hpp>
-#include <boost/type_traits.hpp>
+
 #include <lua.hpp>
+
+#include <format>
+#include <optional>
+#include <variant>
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
 #   include "misc/exception.hpp"
@@ -373,7 +371,36 @@ public:
         auto toCall = load(thread.state, code);
         return call<TType>(thread.state, std::move(toCall));
     }
-    
+
+
+
+	/**
+     * Calls a lua function
+     */
+	template<typename TReturnType, typename... TParameters>
+	auto call(const char* luaFuncName, TParameters&&... input)
+	-> TReturnType
+	{
+		typedef typename Tupleizer<TReturnType>::type
+				RealReturnType;
+
+		// Push function from globals onto stack
+		lua_getglobal(mState, luaFuncName);
+		PushedObject callee(mState, 1);
+
+		// we push the parameters on the stack
+		auto inArguments = Pusher<std::tuple<TParameters&&...>>::push(mState, std::forward_as_tuple(std::forward<TParameters>(input)...));
+
+
+		// Call
+		const int outArgumentsCount = std::tuple_size<RealReturnType>::value;
+		auto outArguments = callRaw(mState, std::move(callee) + std::move(inArguments), outArgumentsCount);
+
+		// pcall succeeded, we pop the returned values and return them
+		return readTopAndPop<TReturnType>(mState, std::move(outArguments));
+	}
+
+
     /**
      * Tells that Lua will be allowed to access an object's function
      * This is the version "registerFunction(name, &Foo::function)"
@@ -1067,9 +1094,9 @@ private:
         -> TReturnType
     {
         auto val = Reader<typename std::decay<TReturnType>::type>::read(state, -object.getNum());
-        if (!val.is_initialized())
+        if (!val.has_value())
             throw WrongTypeException{lua_typename(state, lua_type(state, -object.getNum())), typeid(TReturnType)};
-        return val.get();
+        return val.value();
     }
 
     // checks that the offsets for a type's registrations are set in the registry
@@ -1442,7 +1469,7 @@ private:
             const auto traceBack = readTopAndPop<std::string>(state, std::move(traceBackRef)); // stack top: error
             PushedObject errorCode{state, 1};
 
-            // an error occured during execution, either an error message or a std::exception_ptr was pushed on the stack
+            // an error occurred during execution, either an error message or a std::exception_ptr was pushed on the stack
             if (pcallReturnValue == LUA_ERRMEM) {
                 throw std::bad_alloc{};
 
@@ -1603,7 +1630,7 @@ private:
                     {
                         const void *ptr = lua_topointer(lua, -2);
                         lua_pop(lua, 1);
-                        lua_pushstring(lua, (boost::format("userdata 0x%08x") % reinterpret_cast<intptr_t>(ptr)).str().c_str());
+                        lua_pushstring(lua, std::format("userdata 0x{}", ptr).c_str());
                         return 1;
                     }
                     lua_pushvalue(lua, 1);
@@ -1632,7 +1659,7 @@ private:
             PushedObject pushedTable{state, 1};
 
             // using the garbage collecting function we created above
-            if (!boost::has_trivial_destructor<TType>::value)
+            if (!std::is_trivially_destructible_v<TType>)
             {
                 lua_pushstring(state, "__gc");
                 lua_pushcfunction(state, garbageCallbackFunction);
@@ -1699,15 +1726,18 @@ private:
     
     template<typename TType, typename = void>
     struct Reader {
-        typedef typename std::conditional<std::is_pointer<TType>::value, TType, TType&>::type
+
+        typedef typename std::conditional<std::is_pointer<TType>::value ||
+		std::is_same_v<TType, std::exception_ptr>, TType, TType&>::type
             ReturnType;
         
         static auto read(lua_State* state, int index)
-            -> boost::optional<ReturnType>
+            -> std::optional<ReturnType>
         {
             if (!test(state, index))
-                return boost::none;
-            return boost::optional<ReturnType>(*static_cast<TType*>(lua_touserdata(state, index)));
+                return {};
+	        ReturnType& rt = *static_cast<TType*>(lua_touserdata(state, index));
+            return std::optional<ReturnType>(rt);
         }
 
     private:
@@ -1840,11 +1870,11 @@ private:
     struct FunctionTypeDetector { typedef typename RemoveMemberPointerFunction<decltype(&std::decay<TObjectType>::type::operator())>::type type; };
 
     // this structure takes a function arguments list and has the "min" and the "max" static const member variables, whose value equal to the min and max number of parameters for the function
-    // the only case where "min != max" is with boost::optional at the end of the list
+    // the only case where "min != max" is with std::optional at the end of the list
     template<typename... TArgumentsList>
     struct FunctionArgumentsCounter {};
     
-    // true is the template parameter is a boost::optional
+    // true is the template parameter is a std::optional
     template<typename T>
     struct IsOptional : public std::false_type {};
 };
@@ -1939,7 +1969,7 @@ struct LuaContext::FunctionArgumentsCounter<> {
 
 // implementation of IsOptional
 template<typename T>
-struct LuaContext::IsOptional<boost::optional<T>> : public std::true_type {};
+struct LuaContext::IsOptional<std::optional<T>> : public std::true_type {};
 
 // implementation of LuaFunctionCaller
 template<typename TFunctionType>
@@ -2213,7 +2243,7 @@ struct LuaContext::Pusher<TReturnType (TParameters...)>
     // this is the version of "push" for non-trivially destructible function objects
     template<typename TFunctionObject>
     static auto push(lua_State* state, TFunctionObject fn) noexcept
-        -> typename std::enable_if<!boost::has_trivial_destructor<TFunctionObject>::value, PushedObject>::type
+        -> typename std::enable_if<!std::is_trivially_destructible_v<TFunctionObject>, PushedObject>::type
     {
         // TODO: is_move_constructible not supported by some compilers
         //static_assert(std::is_move_constructible<TFunctionObject>::value, "The function object must be move-constructible");
@@ -2272,7 +2302,7 @@ struct LuaContext::Pusher<TReturnType (TParameters...)>
     // this is the version of "push" for trivially destructible objects
     template<typename TFunctionObject>
     static auto push(lua_State* state, TFunctionObject fn) noexcept
-        -> typename std::enable_if<boost::has_trivial_destructor<TFunctionObject>::value, PushedObject>::type
+        -> typename std::enable_if<std::is_trivially_destructible_v<TFunctionObject>, PushedObject>::type
     {
         // TODO: is_move_constructible not supported by some compilers
         //static_assert(std::is_move_constructible<TFunctionObject>::value, "The function object must be move-constructible");
@@ -2439,45 +2469,45 @@ struct LuaContext::Pusher<std::function<TReturnType (TParameters...)>>
         return SubPusher::push(state, value);
     }
 };
+//
+//// boost::variant
+//template<typename... TTypes>
+//struct LuaContext::Pusher<std::variant<TTypes...>>
+//{
+//    static const int minSize = PusherMinSize<TTypes...>::size;
+//    static const int maxSize = PusherMaxSize<TTypes...>::size;
+//
+//    static PushedObject push(lua_State* state, const std::variant<TTypes...>& value) noexcept {
+//        PushedObject obj{state, 0};
+//        VariantWriter writer{state, obj};
+//        value.apply_visitor(writer);
+//        return obj;
+//    }
+//
+//private:
+//    struct VariantWriter : public boost::static_visitor<> {
+//        template<typename TType>
+//        void operator()(TType value) noexcept
+//        {
+//            obj = Pusher<typename std::decay<TType>::type>::push(state, std::move(value));
+//        }
+//
+//        VariantWriter(lua_State* state_, PushedObject& obj_) : state(state_), obj(obj_) {}
+//        lua_State* state;
+//        PushedObject& obj;
+//    };
+//};
 
-// boost::variant
-template<typename... TTypes>
-struct LuaContext::Pusher<boost::variant<TTypes...>>
-{
-    static const int minSize = PusherMinSize<TTypes...>::size;
-    static const int maxSize = PusherMaxSize<TTypes...>::size;
-
-    static PushedObject push(lua_State* state, const boost::variant<TTypes...>& value) noexcept {
-        PushedObject obj{state, 0};
-        VariantWriter writer{state, obj};
-        value.apply_visitor(writer);
-        return obj;
-    }
-
-private:
-    struct VariantWriter : public boost::static_visitor<> {
-        template<typename TType>
-        void operator()(TType value) noexcept
-        {
-            obj = Pusher<typename std::decay<TType>::type>::push(state, std::move(value));
-        }
-
-        VariantWriter(lua_State* state_, PushedObject& obj_) : state(state_), obj(obj_) {}
-        lua_State* state;
-        PushedObject& obj;
-    };
-};
-
-// boost::optional
+// std::optional
 template<typename TType>
-struct LuaContext::Pusher<boost::optional<TType>> {
+struct LuaContext::Pusher<std::optional<TType>> {
     typedef Pusher<typename std::decay<TType>::type>
         UnderlyingPusher;
 
     static const int minSize = UnderlyingPusher::minSize < 1 ? UnderlyingPusher::minSize : 1;
     static const int maxSize = UnderlyingPusher::maxSize > 1 ? UnderlyingPusher::maxSize : 1;
 
-    static PushedObject push(lua_State* state, const boost::optional<TType>& value) noexcept {
+    static PushedObject push(lua_State* state, const std::optional<TType>& value) noexcept {
         if (value) {
             return UnderlyingPusher::push(state, value.get());
         } else {
@@ -2538,10 +2568,10 @@ template<>
 struct LuaContext::Reader<std::nullptr_t>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<std::nullptr_t>
+        -> std::optional<std::nullptr_t>
     {
         if (!lua_isnil(state, index))
-            return boost::none;
+            return {};
         return nullptr;
     }
 };
@@ -2554,20 +2584,20 @@ struct LuaContext::Reader<
         >
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<TType>
+        -> std::optional<TType>
     {
 #       if LUA_VERSION_NUM >= 502
 
             int success;
             auto value = lua_tointegerx(state, index, &success);
             if (success == 0)
-                return boost::none;
+                return {};
             return static_cast<TType>(value);
 
 #       else
 
             if (!lua_isnumber(state, index))
-                return boost::none;
+                return {};
             return static_cast<TType>(lua_tointeger(state, index));
 
 #       endif
@@ -2582,20 +2612,20 @@ struct LuaContext::Reader<
         >
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<TType>
+        -> std::optional<TType>
     {
 #       if LUA_VERSION_NUM >= 502
 
             int success;
             auto value = lua_tonumberx(state, index, &success);
             if (success == 0)
-                return boost::none;
+                return {};
             return static_cast<TType>(value);
 
 #       else
 
             if (!lua_isnumber(state, index))
-                return boost::none;
+                return {};
             return static_cast<TType>(lua_tonumber(state, index));
 
 #       endif
@@ -2607,10 +2637,10 @@ template<>
 struct LuaContext::Reader<bool>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<bool>
+        -> std::optional<bool>
     {
         if (!lua_isboolean(state, index))
-            return boost::none;
+            return {};
         return lua_toboolean(state, index) != 0;
     }
 };
@@ -2622,7 +2652,7 @@ template<>
 struct LuaContext::Reader<std::string>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<std::string>
+        -> std::optional<std::string>
     {
         std::string result;
 
@@ -2638,7 +2668,7 @@ struct LuaContext::Reader<std::string>
 
         lua_pop(state, 1);
 
-        return val != nullptr ? boost::optional<std::string>{ std::move(result) } : boost::none;
+        return val != nullptr ? std::optional<std::string>{ std::move(result) } : std::optional<std::string>{};
     }
 };
 
@@ -2650,10 +2680,10 @@ struct LuaContext::Reader<
         >
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<TType>
+        -> std::optional<TType>
     {
         if (!lua_isnumber(state, index) || fmod(lua_tonumber(state, index), 1.) != 0)
-            return boost::none;
+            return {};
         return static_cast<TType>(lua_tointeger(state, index));
     }
 };
@@ -2666,10 +2696,10 @@ struct LuaContext::Reader<LuaContext::LuaFunctionCaller<TRetValue (TParameters..
         ReturnType;
 
     static auto read(lua_State* state, int index)
-        -> boost::optional<ReturnType>
+        -> std::optional<ReturnType>
     {
         if (lua_isfunction(state, index) == 0 && lua_isuserdata(state, index) == 0)
-            return boost::none;
+            return {};
         return ReturnType(state, index);
     }
 };
@@ -2679,15 +2709,15 @@ template<typename TRetValue, typename... TParameters>
 struct LuaContext::Reader<std::function<TRetValue (TParameters...)>>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<std::function<TRetValue (TParameters...)>>
+        -> std::optional<std::function<TRetValue (TParameters...)>>
     {
 		if (auto val = Reader<LuaContext::LuaFunctionCaller<TRetValue (TParameters...)>>::read(state, index))
 		{
 			std::function<TRetValue (TParameters...)> f{*val};
-			return boost::optional<std::function<TRetValue (TParameters...)>>{std::move(f)};
+			return std::optional<std::function<TRetValue (TParameters...)>>{std::move(f)};
 		}
 
-        return boost::none;
+        return {};
     }
 };
 
@@ -2696,10 +2726,10 @@ template<typename TType1, typename TType2>
 struct LuaContext::Reader<std::vector<std::pair<TType1,TType2>>>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<std::vector<std::pair<TType1, TType2>>>
+        -> std::optional<std::vector<std::pair<TType1, TType2>>>
     {
         if (!lua_istable(state, index))
-            return boost::none;
+            return {};
 
         std::vector<std::pair<TType1, TType2>> result;
 
@@ -2734,10 +2764,10 @@ template<typename TKey, typename TValue>
 struct LuaContext::Reader<std::map<TKey,TValue>>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<std::map<TKey,TValue>>
+        -> std::optional<std::map<TKey,TValue>>
     {
         if (!lua_istable(state, index))
-            return boost::none;
+            return {};
 
         std::map<TKey,TValue> result;
 
@@ -2772,10 +2802,10 @@ template<typename TKey, typename TValue>
 struct LuaContext::Reader<std::unordered_map<TKey,TValue>>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<std::unordered_map<TKey,TValue>>
+        -> std::optional<std::unordered_map<TKey,TValue>>
     {
         if (!lua_istable(state, index))
-            return boost::none;
+            return {};
 
         std::unordered_map<TKey,TValue> result;
 
@@ -2811,65 +2841,65 @@ struct LuaContext::Reader<std::unordered_map<TKey,TValue>>
 //  * if the value is of the right type, then an optional containing an optional containing the value is returned
 //  * if the value is of the wrong type, then an empty optional is returned
 template<typename TType>
-struct LuaContext::Reader<boost::optional<TType>>
+struct LuaContext::Reader<std::optional<TType>>
 {
     static auto read(lua_State* state, int index)
-        -> boost::optional<boost::optional<TType>>
+        -> std::optional<std::optional<TType>>
     {
         if (lua_isnil(state, index))
-            return boost::optional<TType>{boost::none};
+            return std::optional<TType>{{}};
         if (auto&& other = Reader<TType>::read(state, index))
             return std::move(other);
-        return boost::none;
+        return {};
     }
 };
-
-// variant
-template<typename... TTypes>
-struct LuaContext::Reader<boost::variant<TTypes...>>
-{
-	typedef boost::variant<TTypes...>
-		ReturnType;
-
-private:
-    // class doing operations for a range of types from TIterBegin to TIterEnd
-    template<typename TIterBegin, typename TIterEnd, typename = void>
-    struct VariantReader
-    {
-        using SubReader = Reader<typename std::decay<typename boost::mpl::deref<TIterBegin>::type>::type>;
-
-        static auto read(lua_State* state, int index)
-            -> boost::optional<ReturnType>
-        {
-            // note: using SubReader::read triggers a compilation error when used with a reference
-            if (const auto val = SubReader::read(state, index))
-                return boost::variant<TTypes...>{*val};
-            return VariantReader<typename boost::mpl::next<TIterBegin>::type, TIterEnd>::read(state, index);
-        }
-    };
-
-    // specialization of class above being called when list of remaining types is empty
-    template<typename TIterBegin, typename TIterEnd>
-    struct VariantReader<TIterBegin, TIterEnd, typename std::enable_if<boost::mpl::distance<TIterBegin, TIterEnd>::type::value == 0>::type>
-    {
-        static auto read(lua_State* /*state*/, int /*index*/)
-            -> boost::optional<ReturnType> 
-        {
-            return boost::none;
-        }
-    };
-
-    // this is the main type
-    typedef VariantReader<typename boost::mpl::begin<typename ReturnType::types>::type, typename boost::mpl::end<typename ReturnType::types>::type>
-        MainVariantReader;
-
-public:
-    static auto read(lua_State* state, int index)
-        -> boost::optional<ReturnType>
-    {
-        return MainVariantReader::read(state, index);
-    }
-};
+//
+//// variant
+//template<typename... TTypes>
+//struct LuaContext::Reader<std::variant<TTypes...>>
+//{
+//	typedef boost::variant<TTypes...>
+//		ReturnType;
+//
+//private:
+//    // class doing operations for a range of types from TIterBegin to TIterEnd
+//    template<typename TIterBegin, typename TIterEnd, typename = void>
+//    struct VariantReader
+//    {
+//        using SubReader = Reader<typename std::decay<typename boost::mpl::deref<TIterBegin>::type>::type>;
+//
+//        static auto read(lua_State* state, int index)
+//            -> std::optional<ReturnType>
+//        {
+//            // note: using SubReader::read triggers a compilation error when used with a reference
+//            if (const auto val = SubReader::read(state, index))
+//                return boost::variant<TTypes...>{*val};
+//            return VariantReader<typename boost::mpl::next<TIterBegin>::type, TIterEnd>::read(state, index);
+//        }
+//    };
+//
+//    // specialization of class above being called when list of remaining types is empty
+//    template<typename TIterBegin, typename TIterEnd>
+//    struct VariantReader<TIterBegin, TIterEnd, typename std::enable_if<boost::mpl::distance<TIterBegin, TIterEnd>::type::value == 0>::type>
+//    {
+//        static auto read(lua_State* /*state*/, int /*index*/)
+//            -> std::optional<ReturnType>
+//        {
+//            return {};
+//        }
+//    };
+//
+//    // this is the main type
+//    typedef VariantReader<typename boost::mpl::begin<typename ReturnType::types>::type, typename boost::mpl::end<typename ReturnType::types>::type>
+//        MainVariantReader;
+//
+//public:
+//    static auto read(lua_State* state, int index)
+//        -> std::optional<ReturnType>
+//    {
+//        return MainVariantReader::read(state, index);
+//    }
+//};
 
 // reading a tuple
 // tuple have an additional argument for their functions, that is the maximum size to read
@@ -2878,7 +2908,7 @@ template<>
 struct LuaContext::Reader<std::tuple<>>
 {
     static auto read(lua_State* /*state*/, int /*index*/, int /*maxSize*/ = 0)
-        -> boost::optional<std::tuple<>>
+        -> std::optional<std::tuple<>>
     {
         return std::tuple<>{};
     }
@@ -2895,16 +2925,16 @@ struct LuaContext::Reader<std::tuple<TFirst, TOthers...>,
 		ReturnType;
 
     static auto read(lua_State* state, int index, int maxSize = std::tuple_size<ReturnType>::value)
-        -> boost::optional<ReturnType>
+        -> std::optional<ReturnType>
     {
         if (maxSize <= 0)
-            return boost::none;
+            return {};
 
         auto firstVal = Reader<TFirst>::read(state, index);
         auto othersVal = Reader<std::tuple<TOthers...>>::read(state, index + 1, maxSize - 1);
         
         if (!firstVal || !othersVal)
-            return boost::none;
+            return {};
 
         return std::tuple_cat(std::tuple<TFirst>(*firstVal), std::move(*othersVal));
     }
@@ -2921,18 +2951,18 @@ struct LuaContext::Reader<std::tuple<TFirst, TOthers...>,
 		ReturnType;
     
     static auto read(lua_State* state, int index, int maxSize = std::tuple_size<ReturnType>::value)
-        -> boost::optional<ReturnType>
+        -> std::optional<ReturnType>
     {
         auto othersVal = Reader<std::tuple<TOthers...>>::read(state, index + 1, maxSize - 1);
         if (!othersVal)
-            return boost::none;
+            return {};
         
         if (maxSize <= 0)
             return std::tuple_cat(std::tuple<TFirst>(), std::move(*othersVal));
         
         auto firstVal = Reader<TFirst>::read(state, index);
         if (!firstVal)
-            return boost::none;
+            return {};
 
         return std::tuple_cat(std::tuple<TFirst>(*firstVal), std::move(*othersVal));
     }
